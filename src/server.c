@@ -66,6 +66,9 @@ typedef struct client {
     /* The output buffer for this client. */
     struct evbuffer *output_buffer;
 
+    /* Count of callbacks to read. */
+    int cb_read_count;
+
     /* Here you can add your own application-specific attributes which
      * are connection-specific. */
 } client_t;
@@ -145,6 +148,9 @@ void buffered_on_read(struct bufferevent *bev, void *arg) {
         errorOut("Error sending data to client on fd %d\n", client->fd);
         closeClient(client);
     }
+    /* Remember how many times this read callback has been called.
+     * We might want to limit this in the future to prevent resource hogging */
+    client->cb_read_count++;
 }
 
 /**
@@ -159,13 +165,35 @@ void buffered_on_write(struct bufferevent *bev, void *arg) {
  * descriptor.
  */
 void buffered_on_error(struct bufferevent *bev, short what, void *arg) {
-    closeClient((client_t *)arg);
+    client_t *client = (client_t *)arg;
+
+    /* was this a timeout? */
+    if (what & EV_TIMEOUT) {
+        printf("client [%d]: timeout.\n", client->fd);
+    } else {
+        /* for all other errors */
+        printf("client [%d]: unknown error.\n", client->fd);
+    }
+    closeClient(client);
 }
 
 static void server_job_function(struct job *job) {
     client_t *client = (client_t *)job->user_data;
 
+    printf("client [%d]: event dispatch.\n", client->fd);
+    /* add the timeout at the last moment as the connection
+     * was timing out after accept without ever calling
+     * the 1st read callback */
+    bufferevent_settimeout(client->buf_ev, SOCKET_READ_TIMEOUT_SECONDS,
+            SOCKET_WRITE_TIMEOUT_SECONDS);
+
+    /* Blocks whilst the client is being served by the job function.      */
+    /* As data is read in, the callback buffered_on_read is called.       */
+    /* If the client times out, the callback buffered_on_error is called. */
     event_base_dispatch(client->evbase);
+
+    /* Client is finished, for whatever reason.                           */
+    /* Close the socket (if not already done) and free the client and job */
     closeAndFreeClient(client);
     free(job);
 }
@@ -204,6 +232,9 @@ void on_accept(int fd, short ev, void *arg) {
     memset(client, 0, sizeof(*client));
     client->fd = client_fd;
 
+    printf("client [%d]: accepted connection from %s.\n", client_fd,inet_ntoa(client_addr.sin_addr));
+
+    client->cb_read_count = 0;
     /**
      * Add any custom code anywhere from here to the end of this function
      * to initialize your application-specific attributes in the client struct.
@@ -254,9 +285,6 @@ void on_accept(int fd, short ev, void *arg) {
         return;
     }
     bufferevent_base_set(client->evbase, client->buf_ev);
-
-    bufferevent_settimeout(client->buf_ev, SOCKET_READ_TIMEOUT_SECONDS,
-            SOCKET_WRITE_TIMEOUT_SECONDS);
 
     /* We have to enable it before our callbacks will be
      * called. */
